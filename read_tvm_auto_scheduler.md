@@ -248,7 +248,7 @@ def local_builder_build(inputs, timeout, n_parallel, build_func="default", verbo
         n_parallel, timeout, reset_global_scope, (AutotvmGlobalScope.current,)
     )
     tuple_res = executor.map_with_error_catching(
-        local_build_worker,
+        local_build_worker, #调用了这个函数，之后调到了_local_build_worker
         [
             (
                 i.serialize(),

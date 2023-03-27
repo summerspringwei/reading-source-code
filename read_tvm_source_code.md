@@ -61,8 +61,117 @@ inline op（也就是fusion）是发生在`InjectInline`中的。
 看看TVM是如何做垂直fusion的。
 其限制fusion的对象只能有一个output。
 做inline分两个部分，第一部分直接把被inline的那For循环的body直接替换过去，
-第二步是更新dateflow。我们在其中增加了检查inline的对象的axis是否完全一致的代码。
+第二步是更新dataflow。我们在其中增加了检查inline的对象的axis是否完全一致的代码。
 
+### sche.normalize
+分别对应三件事：
+1. Inline
+2. 把所有的循环都rebase到`[0, extend)`的格式
+
+```C++
+Schedule Schedule::normalize() {
+  Schedule sn = copy();
+  // 1. 处理所有的compute_inline()调度原语
+  InjectInline(sn.operator->(), false);
+  // 2. 不太明白为什么rebase的IterVar Range是空的，难道是后面专门有一个pass算range？
+  RebaseNonZeroMinLoop(sn.operator->());
+  // 3. 这部分处理compute_at()，某些compute_at()绑定到的轴可能被split或者fuse了
+  LegalizeInvalidAttach(sn.operator->());
+  return sn;
+}
+```
+
+1. 这里面一个核心的问题是stage对应到schedule里面是具体是什么？
+   一个stage对应一个Tensor，及产生这个tensor的op（可能是computeOp,也可能是PlaceHolderOp），
+   然后stage里面存在各种轴的信息，其relations保存了axis的关系
+2. 关于`leaf_iter_var`和`iter_var` tvm code中已经有介绍，ko, ki = sch.split(k, factor=4)，则ko和ki为leaf
+3. 
+
+
+在`schedule_lang.cc`中，来查看对stage的作用
+从`split`开始，查看关于axis是如何存储和变换的
+其relations保存了axis的关系父亲轴和split开的轴,all_vars保存了所有的轴的变量，包括原始的和split的。
+leaf_vars保存的是经过变换后的轴。通过`fuse`调度原语也能看到，其做法就是在leaf_vars中删除原来的两个轴，增加fuse的轴，
+root_iter_vars是一开始定义output shape的轴
+增加记录下轴内的relationship。
+
+```C++
+void SplitHelper(StageNode* self, IterVar parent, PrimExpr factor, PrimExpr nparts,
+                 IterVar* p_outer, IterVar* p_inner) {
+  // Check if split is valid.
+  ICHECK(parent->iter_type == kDataPar || parent->iter_type == kCommReduce ||
+         parent->iter_type == kOrdered)
+      << "Cannot split on " << IterVarType2String(parent->iter_type);
+  IterVar outer = IterVar(Range(), parent->var.copy_with_suffix(".outer"), parent->iter_type);
+  IterVar inner = IterVar(Range(), parent->var.copy_with_suffix(".inner"), parent->iter_type);
+  *p_outer = outer;
+  *p_inner = inner;
+  // The splits
+  Array<IterVar>& all_vars = self->all_iter_vars;
+  Array<IterVar>& leaf_vars = self->leaf_iter_vars;
+  size_t pos = FindLeafVar(all_vars.GetArrayNode(), leaf_vars.GetArrayNode(), parent);
+  self->relations.push_back(Split(parent, outer, inner, factor, nparts));
+  // add vars to all vars
+  all_vars.push_back(outer);
+  all_vars.push_back(inner);
+  // replace the position.
+  leaf_vars.erase(leaf_vars.begin() + pos);
+  leaf_vars.insert(leaf_vars.begin() + pos, inner);
+  leaf_vars.insert(leaf_vars.begin() + pos, outer);
+}
+```
+
+关于`compute_at`原语，只能绑定到group的root，并且绑定的轴也必须是leaf_var,
+然后标记其绑定的轴、attach_type和attach_stage
+
+```C++
+
+Stage& Stage::compute_at(Stage parent, IterVar scope) {  // NOLINT(*)
+  ICHECK_NE((*this)->attach_type, kScanUpdate) << "Cannot specify compute_at for scan updates";
+  // Group constraint checking.
+  Stage group = (*this)->group;
+  if (group.defined()) {
+    Stage pg = parent->group;
+    while (pg.defined() && !pg.same_as(group)) {
+      pg = pg->group;
+    }
+    ICHECK(pg.same_as(group)) << "Can only assign compute_at to stages within the same group";
+  }
+
+  (*this)->attach_type = kScope;
+  (*this)->attach_ivar = scope;
+  (*this)->attach_stage = parent;
+  bool found = false;
+  for (size_t i = 0; i < parent->leaf_iter_vars.size(); ++i) {
+    if (scope == parent->leaf_iter_vars[i]) {
+      found = true;
+      break;
+    }
+  }
+  ICHECK(found) << "Cannot find the axis " << scope << " in parent's leaf_iter_vars"
+                << " parent=" << parent;
+  return *this;
+}
+```
+
+
+```C++
+Stmt MakePipeline(const Stage& s, const std::unordered_map<IterVar, Range>& dom_map, Stmt consumer,
+                  bool debug_keep_trivial_loop) {
+  Stmt producer = s->op->BuildProvide(s, dom_map, debug_keep_trivial_loop);
+  if (s->double_buffer) {
+    producer = AttrStmt(s->op, tir::attr::double_buffer_scope, 1, producer);
+  }
+  Stmt pipeline = producer;
+
+  if (consumer.defined() && !is_no_op(consumer)) {
+    pipeline = SeqStmt({producer, consumer});
+  }
+
+  return s->op->BuildRealize(s, dom_map, pipeline, s->scope);
+}
+```
+`MakePipeline`是把computeOp变为`tir`的`stmt`核心函数。
 
 
 ### TVM中循环长度为1的优化
@@ -211,7 +320,19 @@ ComputeOp::ComputeOp(std::string name, std::string tag, Map<String, ObjectRef> a
 relay底层的实现也是用te来做的。以`relay.add`为例，其实现为`_make.add(lhs, rhs)`,
 具体实现在`src/relay/op/tensor/binary.cc`,宏展开后
 ```C++
-TVM_REGISTER_GLOBAL("relay.op._make." "add").set_body_typed([](Expr lhs, Expr rhs) { static const Op& op = Op::Get("add"); return Call(op, {lhs, rhs}, Attrs(), {}); }); RELAY_REGISTER_OP("add") .set_num_inputs(2) .add_argument("lhs", "Tensor", "The left hand side tensor.") .add_argument("rhs", "Tensor", "The right hand side tensor.") .add_type_rel("Broadcast", BroadcastRel) .set_attr<TOpPattern>("TOpPattern", kBroadcast) .set_attr<TOpIsStateful>("TOpIsStateful", false) .set_attr<FInferCorrectLayout>("FInferCorrectLayout", BinaryBroadcastLayout)
+TVM_REGISTER_GLOBAL("relay.op._make." "add")
+  .set_body_typed([](Expr lhs, Expr rhs) 
+  { 
+    static const Op& op = Op::Get("add");
+    return Call(op, {lhs, rhs}, Attrs(), {}); });
+    RELAY_REGISTER_OP("add") 
+      .set_num_inputs(2) 
+      .add_argument("lhs", "Tensor", "The left hand side tensor.") 
+      .add_argument("rhs", "Tensor", "The right hand side tensor.") 
+      .add_type_rel("Broadcast", BroadcastRel) 
+      .set_attr<TOpPattern>("TOpPattern", kBroadcast) 
+      .set_attr<TOpIsStateful>("TOpIsStateful", false) 
+      .set_attr<FInferCorrectLayout>("FInferCorrectLayout", BinaryBroadcastLayout)
 ```
 其调用的为`topi::add`，定义在`include/tvm/topi/broadcast.h`中：宏展开如下：
 ```C++
@@ -235,9 +356,12 @@ inline tvm::te::Tensor add(const tvm::te::Tensor &A, const tvm::PrimExpr &B,
     { return a + b; };
   };
   return tvm::te::compute(
-      A->shape,
-      [&](const ::tvm::Array<::tvm::tir::Var> &i) { return l(A(i), B); }, name,
-      tag);
+      A->shape, // Array<int64>
+      [&](const ::tvm::Array<::tvm::tir::Var> &i) { 
+        return l(A(i), B); 
+      }, // a lambda function
+      name, // string
+      tag); // sting
 }
 inline tvm::te::Tensor add(const tvm::PrimExpr &A, const tvm::te::Tensor &B,
                            std::string name = "T_"
@@ -270,7 +394,6 @@ Tensor compute(Array<PrimExpr> shape, FCompute fcompute, std::string name, std::
     axis.emplace_back(IterVar(Range(0, shape[i]), Var(os.str(), shape[i].dtype()), kDataPar));
     args.push_back(axis.back()->var);
   }
-
   return ComputeOp(name, tag, attrs, axis, {fcompute(args)}).output(0);
 }
 
@@ -2256,3 +2379,49 @@ GraphExecutorCodegen:
       tec::UpdateFunctionMetadata(func, this->function_metadata_);
     }
 ```
+
+
+```C++
+  Expr Rewrite_(const CallNode* pre_call_node, const Expr& post) final {
+    Call pre_call = GetRef<Call>(pre_call_node);
+    Call post_call = Downcast<Call>(post);
+
+    static auto fnoncomputational = Op::GetAttrMap<TNonComputational>("TNonComputational");
+
+    const auto* op_node = post_call->op.as<OpNode>();
+    if (op_node == nullptr) {
+      // Only evaluate primitives.
+      return std::move(post_call);
+    }
+    // Try to evaluate shape_of and ndarray_size ops
+    // Use the original call rather than new_call here since it still has valid checked_type
+    // fields. These operators don't care about the value of their argument anyway.
+    if (Optional<Expr> opt_result = EvaluateShapeOf(pre_call)) {
+      return opt_result.value();
+    }
+    // Use the original call rather than new_call here since it still has valid checked_type
+    // fields. This operator doesn't care about the value of its argument anyway.
+    if (Optional<Expr> opt_result = EvaluateNdarraySize(pre_call)) {
+      return opt_result.value();
+    }
+    // During evaluation we have obviously lost all on_device annotations. However any
+    // on_device wrapping this call will be left in place.
+    return ConstEvaluate(post_call);
+  }
+
+  Expr VisitExpr_(const IfNode* if_node) final {
+    If new_if = Downcast<If>(ExprMutator::VisitExpr_(if_node));
+    if (const auto* const_node = AsIgnoringOnDevice<ConstantNode>(new_if->cond)) {
+      if (reinterpret_cast<uint8_t*>(const_node->data->data)[0]) {
+        return new_if->true_branch;
+      } else {
+        return new_if->false_branch;
+      }
+    }
+    return std::move(new_if);
+  }
+```
+
+### 如何为relay算子注册计算
+1. 之前版本的TVM是通过为relay算子注册属性：`.set_attr<FTVMCompute>`来注册其执行的具体计算的。
+2. 另外一种方式，在Python层面注册执行的计算，可以参见
