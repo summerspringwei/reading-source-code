@@ -132,7 +132,7 @@ We can naturally infer that `compiler_gym-llvm-service` is the compiled binary o
 
 The statement 
 `const auto ret = createAndRunCompilerGymService<LlvmSession>(argc, argv, usage);` creates an RPC service.
-File `/data/xiachunwei/Software/CompilerGym/compiler_gym/service/runtime/CreateAndRunCompilerGymServiceImpl.h:54` shows how the gRPC service is created.
+File `CompilerGym/compiler_gym/service/runtime/CreateAndRunCompilerGymServiceImpl.h:54` shows how the gRPC service is created.
 We can use this info to attach to the process for debugging.
 In class `CompilerGymService`, the following function defines action:
 ```C++
@@ -329,4 +329,10 @@ def update(
     return super().update(actions, observations, observation_view) / self.cost_norm
 ```
 
-**Now we have figured out all the four key elements in CompilerGym's source code, which are `Observation space`, `Action`, `State transition` and `Reward`. Cheers!**
+**Now we have figured out all the four key elements in CompilerGym's source code, which are**
+- `Observation space: A sequence of llvm pass`, 
+- `Action: apply the selected llvm pass`, 
+- `State transition:  Compiling benchmark's module IR to transformed IR by a pass` , 
+- `Reward: normalized reduction in number of instructions comparing with Oz`. 
+
+**Cheers!**
