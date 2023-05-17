@@ -36,6 +36,92 @@ The service is launched by executing the following command:
 ```shell
 ./compiler_gym-llvm-service --working_dir=/dev/shm/compiler_gym_xiachunwei/s/0517T172608-178449-9eaa
 ```
+The `step` function in Python is implemented in `client_service_compiler_env.py:811`.
+The action is packed in `request` and call the LlvmService through gRPC with the following statement:
+` reply = _wrapped_step(self.service, request, timeout)`.
+
+```Python
+def raw_step(
+    self,
+    actions: Iterable[ActionType],
+    observation_spaces: List[ObservationSpaceSpec],
+    reward_spaces: List[Reward],
+    timeout: float = 300,
+) -> StepType:
+    """Take a step.
+
+    :param actions: A list of actions to be applied.
+
+    :param observations: A list of observations spaces to compute
+        observations from. These are evaluated after the actions are
+        applied.
+
+    :param rewards: A list of reward spaces to compute rewards from. These
+        are evaluated after the actions are applied.
+
+    :return: A tuple of observations, rewards, done, and info. Observations
+        and rewards are lists.
+
+    :raises SessionNotFound: If :meth:`reset()
+        <compiler_gym.envs.ClientServiceCompilerEnv.reset>` has not been called.
+
+    .. warning::
+
+        Don't call this method directly, use :meth:`step()
+        <compiler_gym.envs.ClientServiceCompilerEnv.step>` or :meth:`multistep()
+        <compiler_gym.envs.ClientServiceCompilerEnv.multistep>` instead. The
+        :meth:`raw_step() <compiler_gym.envs.ClientServiceCompilerEnv.step>` method is an
+        implementation detail.
+    """
+    ...
+
+    # Record the actions.
+    self._actions += actions
+
+    # Send the request to the backend service.
+    request = StepRequest(
+        session_id=self._session_id,
+        action=[
+            self.service_message_converters.action_converter(a) for a in actions
+        ],
+        observation_space=[
+            observation_space.index for observation_space in observations_to_compute
+        ],
+    )
+    try:
+        reply = _wrapped_step(self.service, request, timeout)
+    ...
+
+    # Get the user-requested observation.
+    observations: List[ObservationType] = [
+        computed_observations[observation_space_index_map[observation_space]]
+        for observation_space in observation_spaces
+    ]
+
+    # Update and compute the rewards.
+    rewards: List[RewardType] = []
+    for reward_space in reward_spaces:
+        reward_observations = [
+            computed_observations[
+                observation_space_index_map[
+                    self.observation.spaces[observation_space]
+                ]
+            ]
+            for observation_space in reward_space.observation_spaces
+        ]
+        rewards.append(
+            float(
+                reward_space.update(actions, reward_observations, self.observation)
+            )
+        )
+
+    info = {
+        "action_had_no_effect": reply.action_had_no_effect,
+        "new_action_space": reply.HasField("new_action_space"),
+    }
+
+    return observations, rewards, reply.end_of_session, info
+```
 
 ### How to find the source code of `compiler_gym-llvm-service`
 
@@ -54,7 +140,7 @@ grpc::Status Step(grpc::ServerContext* context, const StepRequest* request,
                     StepReply* reply) final override;
 ```
 Which is called in the Python level(More details needs to be added here).
-This function is implemented in `CompilerGymServiceImpl.h:138` an is one of the core function of CompilerGym.
+This function is implemented in `CompilerGymServiceImpl.h:138` and is one of the core function of CompilerGym.
 
 ```C++
 
@@ -160,3 +246,87 @@ bool LlvmSession::runPass(llvm::Pass* pass) {
   return passManager.run(benchmark().module());
 }
 ```
+
+### Get observation from Env (Get state-transition)
+
+`CompilerGym`  service call computeObservation to get the reward and state-transition.
+```C++
+Status LlvmSession::computeObservation(const ObservationSpace& observationSpace,
+                                       Event& observation) {
+  DCHECK(benchmark_) << "Calling computeObservation() before init()";
+
+  const auto& it = observationSpaceNames_.find(observationSpace.name());
+  ...
+  const LlvmObservationSpace observationSpaceEnum = it->second;
+
+  return setObservation(observationSpaceEnum, workingDirectory(), benchmark(), observation);
+}
+```
+The `ObservationSpaces` is defined in `ObservationSpaces.h:24` and we can find `AutoPhase` here.
+They reveal the features of LLVM IR from some aspects like text size or runtime on a specific hard.
+Then `LlvmSession` call the `setObservation` (Implemented in `Observation.cc:40`) to get the observation.
+The observation is consisted with reward, state-transition and
+other customized info and packed in `Event& reply`.
+The `relay` will be sent back to the Python level by the gRPC service.
+The function `setObservation` will compute the corresponding observation based on the `LlvmObservationSpace`.
+Here we list the `AutoPhase`:
+```C++
+Status setObservation(LlvmObservationSpace space, const fs::path& workingDirectory,
+                      Benchmark& benchmark, Event& reply) {
+  switch (space) {
+    ...
+    case LlvmObservationSpace::AUTOPHASE: {
+      const auto features = autophase::InstCount::getFeatureVector(benchmark.module());
+      *reply.mutable_int64_tensor()->mutable_shape()->Add() = features.size();
+      *reply.mutable_int64_tensor()->mutable_value() = {features.begin(), features.end()};
+      break;
+    }
+    ...
+    return Status::OK;
+  }
+
+```
+We can see that the `AutoPhase` get the feature vector from the module's LLVM IR, and pack the feature to `relay`.
+Now we have figure it out how a step is applied in `LlvmEnv`.
+Let's go back to Python code.
+
+### Compute the reward
+The reward is update in the `raw_step` function with the following statements:
+
+```Python
+# Update and compute the rewards.
+rewards: List[RewardType] = []
+for reward_space in reward_spaces:
+    reward_observations = [
+        computed_observations[
+            observation_space_index_map[
+                self.observation.spaces[observation_space]
+            ]
+        ]
+        for observation_space in reward_space.observation_spaces
+    ]
+    rewards.append(
+        float(
+            reward_space.update(actions, reward_observations, self.observation)
+        )
+    )
+```
+The `reward_observation_spaces` is of type `ObservationSpaceSpec(IrInstructionCountOz)`(defined in `observation_space_spec.py:14` and instanized in `llvm_env.py:127 BaselineImprovementNormalizedReward`).
+The `reward_space` is `IrInstructionCountOz` (),
+which contains `benchmark` and `cost_function`.
+The `update` function is defined in class `BaselineImprovementNormalizedReward` at `llvm_reward.py:74`:
+
+```Python
+def update(
+    self,
+    actions: List[ActionType],
+    observations: List[ObservationType],
+    observation_view: ObservationView,
+) -> RewardType:
+    """Called on env.step(). Compute and return new reward."""
+    if self.cost_norm is None:
+        self.cost_norm = self.get_cost_norm(observation_view)
+    return super().update(actions, observations, observation_view) / self.cost_norm
+```
+
+**Now we have figured out all the four key elements in CompilerGym's source code, which are `Observation space`, `Action`, `State transition` and `Reward`. Cheers!**
